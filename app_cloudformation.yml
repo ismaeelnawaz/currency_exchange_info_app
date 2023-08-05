@@ -86,6 +86,68 @@ Resources:
       RuntimeManagementConfig:
         UpdateRuntimeOn: Auto
 
+  UEDCFN:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: 'Adds updated data from european bank to dynamodb table'
+      FunctionName: 'UpdateExchangeDataCFN'
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role:
+        Fn::GetAtt: 
+          - "LambdaRole"
+          - "Arn"
+      Environment:
+        Variables:
+          TableName: CurrencyExchangeInfo
+          KeyName: currency_name
+      MemorySize: 128
+      Timeout: 3
+      Code:
+        ZipFile: |
+          #importing packages
+
+          import json
+          import boto3
+          import urllib3
+          from datetime import datetime
+          from xml.etree import ElementTree
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              
+              # get currency excahnge data
+              http = urllib3.PoolManager()
+              response = http.request('GET', "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml")
+              
+              # process xml data from the european bank api
+              tree_response = ElementTree.fromstring(response.data)
+              
+              # filter the data
+              current_date_ex_rate = {}
+              for child in tree_response.iter('*'):
+                  if "time" in child.attrib.keys():
+                      current_date_ex_rate[child.attrib["time"]] = {}
+                      current_iteration_date = child.attrib["time"]
+                  elif "currency" in child.attrib.keys():
+                      current_date_ex_rate[current_iteration_date][child.attrib["currency"]] = child.attrib["rate"]
+                      
+              # data ingestion to dynamodb table
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('CurrencyExchangeInfo')
+              response = table.put_item(
+                Item={
+                      'currency_name': 'Euro',
+                      "exchange_rates": current_date_ex_rate
+                      
+                  }
+              )
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+
   DynamoDBTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -369,7 +431,7 @@ Resources:
 
   Primerinvoke:
     Type: AWS::CloudFormation::CustomResource
-    DependsOn: UED
+    DependsOn: UEDCFN
     Version: "1.0"
     Properties:
-      ServiceToken: !GetAtt UED.Arn
+      ServiceToken: !GetAtt UEDCFN.Arn
