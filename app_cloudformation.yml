@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: An AWS Serverless Specification template describing your function.
+
+Resources:
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: ExchangeAppLambda
+      Description: "Execution role for the lambda function"
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  UED:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: 'Adds updated data from european bank to dynamodb table'
+      FunctionName: 'UpdateExchangeData'
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role:
+        Fn::GetAtt: 
+          - "LambdaRole"
+          - "Arn"
+      Environment:
+        Variables:
+          TableName: CurrencyExchangeInfo
+          KeyName: currency_name
+      MemorySize: 128
+      Timeout: 3
+      Code:
+        ZipFile: |
+          #importing packages
+
+          import json
+          import boto3
+          import urllib3
+          from datetime import datetime
+          from xml.etree import ElementTree
+
+          def lambda_handler(event, context):
+              
+              # get currency excahnge data
+              http = urllib3.PoolManager()
+              response = http.request('GET', "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml")
+              
+              # process xml data from the european bank api
+              tree_response = ElementTree.fromstring(response.data)
+              
+              # filter the data
+              current_date_ex_rate = {}
+              for child in tree_response.iter('*'):
+                  if "time" in child.attrib.keys():
+                      current_date_ex_rate[child.attrib["time"]] = {}
+                      current_iteration_date = child.attrib["time"]
+                  elif "currency" in child.attrib.keys():
+                      current_date_ex_rate[current_iteration_date][child.attrib["currency"]] = child.attrib["rate"]
+                      
+              # data ingestion to dynamodb table
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('CurrencyExchangeInfo')
+              response = table.put_item(
+                Item={
+                      'currency_name': 'Euro',
+                      "exchange_rates": current_date_ex_rate
+                      
+                  }
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': response
+              }
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - 
+          AttributeName: currency_name
+          AttributeType: "S"
+      BillingMode: PROVISIONED
+      KeySchema:
+        -
+          AttributeName: currency_name
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: CurrencyExchangeInfo
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: default
+      Description: ''
+      Name: UpdateExchangeData
+      ScheduleExpression: rate(2 minutes)
+      State: ENABLED
+      Targets:
+        - Id: 'TargetFunctionV1'
+          Arn: 
+            Fn::GetAtt:
+              - 'UED'
+              - 'Arn'
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "UED"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EventRule"
+          - "Arn"
+
+  DER:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: 'REST API function to get daily exhange rate'
+      FunctionName: 'DailyExchangeRate'
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role:
+        Fn::GetAtt: 
+          - "LambdaRole"
+          - "Arn"
+      Environment:
+        Variables:
+          TableName: CurrencyExchangeInfo
+          KeyName: currency_name
+      MemorySize: 128
+      Timeout: 3
+      Code:
+        ZipFile: |
+          # import packages
+          import json
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              # read data from the dynamodb
+              # currently we only have data against Euro exhange rate
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('CurrencyExchangeInfo')
+              response = table.get_item(
+                  Key={
+                      'currency_name': 'Euro'
+                  }
+              )
+              item = response['Item']
+              
+              # sort data for the exchange data
+              ordered_exchange_data = sorted(item["exchange_rates"].items(), key = lambda x:datetime.strptime(x[0], '%Y-%m-%d'), reverse=True)
+              
+              # process the data
+              current_date = ordered_exchange_data[0][0]
+              previous_day_date = ordered_exchange_data[1][0]
+              current_data = ordered_exchange_data[0][1]
+              previous_day_data = ordered_exchange_data[1][1]
+              
+              # generate rest api response
+              response_body = {
+                  "currency_name": item["currency_name"],
+                  "current_exchange_rates": current_data,
+                  "current_date": current_date
+              }
+              return {
+                  'statusCode': 200,
+                  'body': response_body
+              }
+
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+
+  DERB:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: 'REST API function to get changes against previous day'
+      FunctionName: 'DailyExchangeRateBehaviour'
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role:
+        Fn::GetAtt: 
+          - "LambdaRole"
+          - "Arn"
+      Environment:
+        Variables:
+          TableName: CurrencyExchangeInfo
+          KeyName: currency_name
+      MemorySize: 128
+      Timeout: 3
+      Code:
+        ZipFile: |
+          # import packages
+          import json
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              # read data from the dynamodb
+              # currently we only have data against Euro exhange rate
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('CurrencyExchangeInfo')
+              response = table.get_item(
+                  Key={
+                      'currency_name': 'Euro'
+                  }
+              )
+              item = response['Item']
+              
+              # sort data for the exchange data
+              ordered_exchange_data = sorted(item["exchange_rates"].items(), key = lambda x:datetime.strptime(x[0], '%Y-%m-%d'), reverse=True)
+              
+              # process the data
+              current_date = ordered_exchange_data[0][0]
+              previous_day_date = ordered_exchange_data[1][0]
+              current_data = ordered_exchange_data[0][1]
+              previous_day_data = ordered_exchange_data[1][1]
+              
+              current_rates = [float(i) for i in current_data.values()]
+              previous_day_rates = [float(i) for i in previous_day_data.values()]
+              
+              difference = []
+              for x in range(len(current_rates)):
+                  difference.append(round((current_rates[x] - previous_day_rates[x]), 4))
+              
+              # generate rest api response
+              response_body = {
+                  "currency_name": item["currency_name"],
+                  "current_exchange_rates": current_data,
+                  "current_date": current_date,
+                  "previous_day_date": previous_day_date,
+                  "exchnage_rate_change": dict(zip(current_data.keys(), difference))
+              }
+              return {
+                  'statusCode': 200,
+                  'body': response_body
+              }
+
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+
+  DERBRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: 'REST API to get changes against previous day'
+      Name: DailyExchangeRateBehaviour
+      EndpointConfiguration:
+        Types:
+          - EDGE
+
+  DERBResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt DERBRestAPI.RootResourceId
+      PathPart: 'DailyExchangeRateBehaviour'
+      RestApiId: !Ref DERBRestAPI
+
+  DERBMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DERBRestAPI
+      ResourceId: !Ref DERBResource
+      AuthorizationType: NONE
+      HttpMethod: GET
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt DERB.Arn
+      ResourceId: !Ref DERBResource
+      RestApiId: !Ref DERBRestAPI
+    DependsOn:
+      - DERBResource
+
+  DERBDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DERBMethod
+    Properties:
+      RestApiId: !Ref DERBRestAPI
+      StageName: 'v0'
+
+  DERBPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt DERB.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - DERBDeployment
+
+  DERRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: 'REST API to get current day exchange rate'
+      Name: DailyExchangeRate
+      EndpointConfiguration:
+        Types:
+          - EDGE
+
+  DERResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt DERRestAPI.RootResourceId
+      PathPart: 'DailyExchangeRate'
+      RestApiId: !Ref DERRestAPI
+
+  DERMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DERRestAPI
+      ResourceId: !Ref DERResource
+      AuthorizationType: NONE
+      HttpMethod: GET
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt DER.Arn
+      ResourceId: !Ref DERResource
+      RestApiId: !Ref DERRestAPI
+    DependsOn:
+      - DERResource
+
+  DERDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DERMethod
+    Properties:
+      RestApiId: !Ref DERRestAPI
+      StageName: 'v0'
+  
+  DERPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt DER.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - DERDeployment
