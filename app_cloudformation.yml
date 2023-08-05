@@ -109,7 +109,7 @@ Resources:
       EventBusName: default
       Description: ''
       Name: UpdateExchangeData
-      ScheduleExpression: rate(2 minutes)
+      ScheduleExpression: rate(12 hours)
       State: ENABLED
       Targets:
         - Id: 'TargetFunctionV1'
@@ -366,3 +366,10 @@ Resources:
       Principal: apigateway.amazonaws.com
     DependsOn:
       - DERDeployment
+
+  Primerinvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: UED
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt UED.Arn
